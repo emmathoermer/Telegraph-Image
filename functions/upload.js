@@ -1,5 +1,22 @@
 import { errorHandling, telemetryData } from "./utils/middleware";
 
+// 安全防护：允许的 MIME 类型前缀白名单
+const ALLOWED_MIME_PREFIXES = ['image/', 'video/', 'audio/'];
+
+// 安全防护：高危文件扩展名黑名单（防止 MIME 伪造绕过）
+const BLOCKED_EXTENSIONS = [
+    'js', 'mjs', 'cjs', 'ts', 'jsx', 'tsx',       // JavaScript/TypeScript
+    'php', 'phtml', 'phar', 'php3', 'php4', 'php5', // PHP
+    'py', 'pyc', 'pyo',                              // Python
+    'rb', 'pl', 'sh', 'bash', 'zsh', 'csh',         // 脚本语言
+    'exe', 'dll', 'so', 'bat', 'cmd', 'ps1', 'vbs', // 可执行文件
+    'jsp', 'jspx', 'asp', 'aspx', 'cer', 'asa',     // Web 服务端脚本
+    'cfm', 'cfml', 'cgi', 'htaccess', 'env',        // 配置/CGI
+    'html', 'htm', 'xhtml', 'svg',                   // 可执行 HTML/SVG
+    'jar', 'war', 'class',                            // Java
+    'msi', 'scr', 'com',                              // Windows 可执行
+];
+
 export async function onRequestPost(context) {
     const { request, env } = context;
 
@@ -18,6 +35,25 @@ export async function onRequestPost(context) {
         const fileName = uploadFile.name;
         const fileExtension = fileName.split('.').pop().toLowerCase();
 
+        // ===== 安全检查 1：MIME 类型白名单 =====
+        const isAllowedMime = ALLOWED_MIME_PREFIXES.some(prefix => uploadFile.type.startsWith(prefix));
+        if (!isAllowedMime) {
+            console.warn(`[SECURITY] Blocked upload: MIME type "${uploadFile.type}" not allowed. File: "${fileName}"`);
+            return new Response(
+                JSON.stringify({ error: 'File type not allowed. Only images, videos, and audio files are accepted.' }),
+                { status: 403, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+
+        // ===== 安全检查 2：扩展名黑名单（防止 MIME 伪造） =====
+        if (BLOCKED_EXTENSIONS.includes(fileExtension)) {
+            console.warn(`[SECURITY] Blocked upload: extension ".${fileExtension}" is blacklisted. File: "${fileName}"`);
+            return new Response(
+                JSON.stringify({ error: 'File extension not allowed.' }),
+                { status: 403, headers: { 'Content-Type': 'application/json' } }
+            );
+        }
+
         const telegramFormData = new FormData();
         telegramFormData.append("chat_id", env.TG_Chat_ID);
 
@@ -32,9 +68,6 @@ export async function onRequestPost(context) {
         } else if (uploadFile.type.startsWith('video/')) {
             telegramFormData.append("video", uploadFile);
             apiEndpoint = 'sendVideo';
-        } else {
-            telegramFormData.append("document", uploadFile);
-            apiEndpoint = 'sendDocument';
         }
 
         const result = await sendToTelegram(telegramFormData, apiEndpoint, env);
