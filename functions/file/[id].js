@@ -1,3 +1,5 @@
+import { extensionOf, typeForExtension } from "../utils/fileTypes.js";
+
 export async function onRequest(context) {
     const {
         request,
@@ -24,14 +26,32 @@ export async function onRequest(context) {
         fileUrl = `https://api.telegram.org/file/bot${env.TG_Bot_Token}/${filePath}`;
     }
 
-    const response = await fetch(fileUrl, {
-        method: request.method,
-        headers: request.headers,
-        body: request.body,
+    // Only forward the few headers needed for caching and video seeking.
+    // Never forward the visitor's own headers (e.g. Authorization / Cookie)
+    // to the upstream server.
+    const upstreamHeaders = new Headers();
+    for (const name of FORWARDED_REQUEST_HEADERS) {
+        const value = request.headers.get(name);
+        if (value) upstreamHeaders.set(name, value);
+    }
+    const upstream = await fetch(fileUrl, {
+        method: request.method === 'HEAD' ? 'HEAD' : 'GET',
+        headers: upstreamHeaders,
     });
 
-    // If the response is OK, proceed with further checks
-    if (!response.ok) return response;
+    // Upstream error bodies are not relayed: they could be HTML rendered
+    // on this domain.
+    if (upstream.status === 304) {
+        return secureFileResponse(upstream, extensionOf(params.id));
+    }
+    if (!upstream.ok) {
+        return new Response(`File not available (${upstream.status})`, {
+            status: upstream.status,
+            headers: SAFE_ERROR_HEADERS,
+        });
+    }
+
+    const response = secureFileResponse(upstream, extensionOf(params.id));
 
     // Log response details
     console.log(response.ok, response.status);
@@ -152,4 +172,38 @@ async function getFilePath(env, file_id) {
         console.error('Error fetching file path:', error.message);
         return null;
     }
+}
+
+const FORWARDED_REQUEST_HEADERS = ['range', 'if-none-match', 'if-modified-since', 'if-range'];
+
+const SAFE_ERROR_HEADERS = {
+    'Content-Type': 'text/plain;charset=UTF-8',
+    'X-Content-Type-Options': 'nosniff',
+    'Cache-Control': 'no-store',
+};
+
+// Never let a stored file be rendered as a page on this domain: the
+// Content-Type is decided by our extension allowlist, not by the upstream
+// server or the uploader. Anything outside the allowlist is download-only
+// and sandboxed.
+function secureFileResponse(upstream, ext) {
+    const headers = new Headers(upstream.headers);
+    headers.delete('Set-Cookie');
+    headers.delete('Content-Disposition');
+    headers.set('X-Content-Type-Options', 'nosniff');
+
+    const type = typeForExtension(ext);
+    if (type) {
+        headers.set('Content-Type', type.mime);
+    } else {
+        headers.set('Content-Type', 'application/octet-stream');
+        headers.set('Content-Disposition', 'attachment');
+        headers.set('Content-Security-Policy', "sandbox; default-src 'none'");
+    }
+
+    return new Response(upstream.body, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers,
+    });
 }

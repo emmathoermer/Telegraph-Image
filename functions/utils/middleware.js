@@ -1,6 +1,8 @@
 import sentryPlugin from "@cloudflare/pages-plugin-sentry";
 import '@sentry/tracing';
 
+const SENSITIVE_HEADERS = ['authorization', 'cookie', 'proxy-authorization'];
+
 export async function errorHandling(context) {
   const env = context.env;
   if (typeof env.disable_telemetry == "undefined" || env.disable_telemetry == null || env.disable_telemetry == "") {
@@ -30,6 +32,10 @@ export function telemetryData(context) {
     try {
       const parsedHeaders = {};
       context.request.headers.forEach((value, key) => {
+        // Never ship credentials or cookies to the telemetry service.
+        if (SENSITIVE_HEADERS.includes(key.toLowerCase())) {
+          return;
+        }
         parsedHeaders[key] = value
         //check if the value is empty
         if (value.length > 0) {
@@ -48,10 +54,13 @@ export function telemetryData(context) {
           }
         }
       }
+      // Drop the query string: it can carry secrets (e.g. the webhook secret).
+      const requestUrl = new URL(context.request.url);
+      const safeUrl = `${requestUrl.origin}${requestUrl.pathname}`;
       const data = {
         headers: parsedHeaders,
         cf: parsedCF,
-        url: context.request.url,
+        url: safeUrl,
         method: context.request.method,
         redirect: context.request.redirect,
       }

@@ -1,24 +1,18 @@
-import { errorHandling, telemetryData } from "./utils/middleware";
-
-// 安全防护：允许的 MIME 类型前缀白名单
-const ALLOWED_MIME_PREFIXES = ['image/', 'video/', 'audio/'];
-
-// 安全防护：高危文件扩展名黑名单（防止 MIME 伪造绕过）
-const BLOCKED_EXTENSIONS = [
-    'js', 'mjs', 'cjs', 'ts', 'jsx', 'tsx',       // JavaScript/TypeScript
-    'php', 'phtml', 'phar', 'php3', 'php4', 'php5', // PHP
-    'py', 'pyc', 'pyo',                              // Python
-    'rb', 'pl', 'sh', 'bash', 'zsh', 'csh',         // 脚本语言
-    'exe', 'dll', 'so', 'bat', 'cmd', 'ps1', 'vbs', // 可执行文件
-    'jsp', 'jspx', 'asp', 'aspx', 'cer', 'asa',     // Web 服务端脚本
-    'cfm', 'cfml', 'cgi', 'htaccess', 'env',        // 配置/CGI
-    'html', 'htm', 'xhtml', 'svg',                   // 可执行 HTML/SVG
-    'jar', 'war', 'class',                            // Java
-    'msi', 'scr', 'com',                              // Windows 可执行
-];
+import { errorHandling, telemetryData } from "./utils/middleware.js";
+import { authConfigured, hasValidCredentials, unauthorizedResponse, uploadDisabledResponse } from "./utils/auth.js";
+import { extensionOf, typeForExtension } from "./utils/fileTypes.js";
 
 export async function onRequestPost(context) {
     const { request, env } = context;
+
+    // Defense in depth: functions/_middleware.js already requires login for
+    // /upload, but never let this handler become an open uploader on its own.
+    if (!authConfigured(env)) {
+        return uploadDisabledResponse();
+    }
+    if (!(await hasValidCredentials(request, env))) {
+        return unauthorizedResponse();
+    }
 
     try {
         const clonedRequest = request.clone();
@@ -33,23 +27,20 @@ export async function onRequestPost(context) {
         }
 
         const fileName = uploadFile.name;
-        const fileExtension = fileName.split('.').pop().toLowerCase();
+        const fileExtension = extensionOf(fileName);
 
-        // ===== 安全检查 1：MIME 类型白名单 =====
-        const isAllowedMime = ALLOWED_MIME_PREFIXES.some(prefix => uploadFile.type.startsWith(prefix));
-        if (!isAllowedMime) {
-            console.warn(`[SECURITY] Blocked upload: MIME type "${uploadFile.type}" not allowed. File: "${fileName}"`);
+        // Only an allowlist of image / video / audio extensions is accepted.
+        // The extension decides the category; the browser-supplied MIME type
+        // can be forged, so it may only agree with it (or be absent).
+        const allowedType = typeForExtension(fileExtension);
+        const claimedMime = (uploadFile.type || '').toLowerCase();
+        const mimeAgrees = claimedMime === ''
+            || claimedMime === 'application/octet-stream'
+            || (allowedType && claimedMime.startsWith(`${allowedType.category}/`));
+        if (!allowedType || !mimeAgrees) {
+            console.warn(`[SECURITY] Blocked upload: name "${fileName}", type "${uploadFile.type}"`);
             return new Response(
                 JSON.stringify({ error: 'File type not allowed. Only images, videos, and audio files are accepted.' }),
-                { status: 403, headers: { 'Content-Type': 'application/json' } }
-            );
-        }
-
-        // ===== 安全检查 2：扩展名黑名单（防止 MIME 伪造） =====
-        if (BLOCKED_EXTENSIONS.includes(fileExtension)) {
-            console.warn(`[SECURITY] Blocked upload: extension ".${fileExtension}" is blacklisted. File: "${fileName}"`);
-            return new Response(
-                JSON.stringify({ error: 'File extension not allowed.' }),
                 { status: 403, headers: { 'Content-Type': 'application/json' } }
             );
         }
@@ -59,13 +50,13 @@ export async function onRequestPost(context) {
 
         // 根据文件类型选择合适的上传方式
         let apiEndpoint;
-        if (uploadFile.type.startsWith('image/')) {
+        if (allowedType.category === 'image') {
             telegramFormData.append("photo", uploadFile);
             apiEndpoint = 'sendPhoto';
-        } else if (uploadFile.type.startsWith('audio/')) {
+        } else if (allowedType.category === 'audio') {
             telegramFormData.append("audio", uploadFile);
             apiEndpoint = 'sendAudio';
-        } else if (uploadFile.type.startsWith('video/')) {
+        } else {
             telegramFormData.append("video", uploadFile);
             apiEndpoint = 'sendVideo';
         }
