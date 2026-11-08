@@ -215,12 +215,34 @@ describe('file serving', function () {
 });
 
 describe('telemetry', function () {
+  function sentryContext(env, tags) {
+    const context = {
+      env,
+      request: new Request('https://img.example/file/x.png'),
+      data: { sentry: { setTag: (k, v) => { tags[k] = v; }, setContext() {}, startTransaction: () => ({ finish() {} }) } },
+      next: async () => new Response('ok'),
+    };
+    context.request.cf = {};
+    return context;
+  }
+
+  it('is off unless enable_telemetry is set, and disable_telemetry wins', async function () {
+    const { telemetryData, telemetryEnabled } = await import('../functions/utils/middleware.js');
+    assert.strictEqual(telemetryEnabled({}), false);
+    assert.strictEqual(telemetryEnabled({ enable_telemetry: '' }), false);
+    assert.strictEqual(telemetryEnabled({ enable_telemetry: '1' }), true);
+    assert.strictEqual(telemetryEnabled({ enable_telemetry: '1', disable_telemetry: '1' }), false);
+    const tags = {};
+    await telemetryData(sentryContext({}, tags));
+    assert.deepStrictEqual(tags, {});
+  });
+
   it('never tags credentials, cookies or query strings', async function () {
     const { telemetryData } = await import('../functions/utils/middleware.js');
     const tags = {};
     let ctx;
     const context = {
-      env: {},
+      env: { enable_telemetry: '1' },
       request: new Request('https://img.example/api/telegram-webhook?secret=TOPSECRET', {
         headers: { Authorization: GOOD_AUTH, Cookie: 'sid=1', 'User-Agent': 'ua' },
       }),
@@ -239,4 +261,118 @@ describe('telemetry', function () {
     assert.ok(!/s3cret|YWRtaW46czNjcmV0|sid=1|TOPSECRET/.test(dump), dump);
     assert.strictEqual(tags['user-agent'], 'ua');
   });
+});
+
+describe('telegram bot webhook', function () {
+  let onRequestPost;
+  const realFetch = global.fetch;
+  let calls, puts, adminLookup;
+
+  before(async function () {
+    onRequestPost = (await import('../functions/api/telegram-webhook.js')).onRequestPost;
+  });
+  beforeEach(function () {
+    calls = [];
+    puts = [];
+    adminLookup = () => new Response(JSON.stringify({
+      ok: true,
+      result: [{ user: { id: 42, is_bot: false } }, { user: { id: 7, is_bot: true } }],
+    }));
+    global.fetch = async (url, init) => {
+      url = String(url);
+      calls.push({ url, body: init && init.body ? JSON.parse(init.body) : null });
+      if (url.includes('/getChatAdministrators?')) return adminLookup();
+      return new Response(JSON.stringify({ ok: true }));
+    };
+  });
+  afterEach(function () { global.fetch = realFetch; });
+
+  const kv = { put: async (key) => { puts.push(key); } };
+  const baseEnv = () => ({ TG_Webhook_Secret: 'S', TG_Bot_Token: 'T', TG_Chat_ID: '-100123', img_url: kv });
+
+  function send(message, env = baseEnv(), secret = 'S') {
+    const update = { message: { message_id: 1, chat: { id: message.from.id, type: 'private' }, ...message } };
+    const request = new Request(`https://img.example/api/telegram-webhook?secret=${secret}`, {
+      method: 'POST', body: JSON.stringify(update), headers: { 'Content-Type': 'application/json' },
+    });
+    return onRequestPost({ request, env });
+  }
+  const photo = (from) => ({ from: { id: from }, photo: [{ file_id: 'P', file_size: 1 }] });
+  const doc = (from, file_name, mime_type) => ({ from: { id: from }, document: { file_id: 'D', file_name, mime_type, file_size: 1 } });
+  const replies = () => calls.filter(c => c.url.endsWith('/sendMessage')).map(c => c.body.text);
+
+  it('still rejects a wrong webhook secret', async function () {
+    const res = await send(photo(42), baseEnv(), 'nope');
+    assert.strictEqual(res.status, 401);
+    assert.strictEqual(calls.length, 0);
+  });
+
+  it('gives the channel admin a link', async function () {
+    await send(photo(42));
+    assert.deepStrictEqual(puts, ['P.jpg']);
+    assert.match(replies()[0], /\/file\/P\.jpg/);
+    assert.ok(calls[0].url.includes('chat_id=-100123'));
+  });
+
+  it('refuses strangers and tells them their ID', async function () {
+    await send(photo(99));
+    assert.deepStrictEqual(puts, []);
+    assert.strictEqual(replies().length, 1);
+    assert.match(replies()[0], /私人/);
+    assert.match(replies()[0], /99/);
+    assert.doesNotMatch(replies()[0], /\/file\//);
+  });
+
+  it('does not count bot admins as owners', async function () {
+    await send(photo(7));
+    assert.deepStrictEqual(puts, []);
+  });
+
+  it('refuses everyone when the admin lookup fails', async function () {
+    adminLookup = () => new Response(JSON.stringify({ ok: false, description: 'Forbidden' }), { status: 403 });
+    await send(photo(42));
+    adminLookup = () => { throw new Error('network'); };
+    await send(photo(42));
+    adminLookup = () => new Response('not json');
+    await send(photo(42));
+    assert.deepStrictEqual(puts, []);
+  });
+
+  it('uses TG_Allowed_Users instead of the admin list when set', async function () {
+    const env = { ...baseEnv(), TG_Allowed_Users: '99, 100' };
+    await send(photo(99), env);
+    await send(photo(42), env);
+    assert.deepStrictEqual(puts, ['P.jpg']);
+    assert.ok(!calls.some(c => c.url.includes('getChatAdministrators')));
+  });
+
+  it('allows only that person when TG_Chat_ID is a private chat', async function () {
+    const env = { ...baseEnv(), TG_Chat_ID: '42' };
+    await send(photo(42), env);
+    await send(photo(43), env);
+    assert.deepStrictEqual(puts, ['P.jpg']);
+    assert.ok(!calls.some(c => c.url.includes('getChatAdministrators')));
+  });
+
+  it('ignores messages without a sender', async function () {
+    const update = { message: { message_id: 1, chat: { id: 5, type: 'private' }, photo: [{ file_id: 'P' }] } };
+    const request = new Request('https://img.example/api/telegram-webhook?secret=S', { method: 'POST', body: JSON.stringify(update) });
+    await onRequestPost({ request, env: baseEnv() });
+    assert.deepStrictEqual(puts, []);
+  });
+
+  for (const [name, mime] of [['evil.html', 'image/png'], ['x.svg', 'image/svg+xml'], [undefined, 'image/svg+xml'], ['a.png', 'video/mp4'], ['v816.php7', 'image/png'], ['notes.txt', 'text/plain']]) {
+    it(`rejects the document ${name} (${mime}) from the owner`, async function () {
+      await send(doc(42, name, mime));
+      assert.deepStrictEqual(puts, []);
+      assert.match(replies()[0], /不支持/);
+    });
+  }
+
+  for (const [name, mime, key] of [['Photo.PNG', 'image/png', 'D.png'], [undefined, 'image/webp', 'D.webp'], ['clip.mov', 'video/quicktime', 'D.mov']]) {
+    it(`accepts the document ${name} (${mime}) from the owner as ${key}`, async function () {
+      await send(doc(42, name, mime));
+      assert.deepStrictEqual(puts, [key]);
+    });
+  }
 });

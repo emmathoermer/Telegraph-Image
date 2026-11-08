@@ -3,7 +3,11 @@
  * 
  * 功能：在 Telegram 中发送图片/视频给 Bot，自动返回图床链接
  * 路径：POST /api/telegram-webhook?secret=xxx
+ * 只有图床主人能用，规则见 ../utils/telegramAccess.js
  */
+
+import { isAllowedBotUser } from '../utils/telegramAccess.js';
+import { ALLOWED_TYPES, extensionOf, typeForExtension } from '../utils/fileTypes.js';
 
 export async function onRequestPost(context) {
     const { request, env } = context;
@@ -25,6 +29,16 @@ export async function onRequestPost(context) {
 
         const message = update.message;
         const chatId = message.chat.id;
+
+        // 只给图床主人用：陌生人发来的任何内容都不生成链接
+        const senderId = message.from && message.from.id;
+        if (!(await isAllowedBotUser(env, senderId))) {
+            await sendTelegramMessage(env, chatId,
+                '🔒 这是私人图床 Bot，不对外开放。\n\n' +
+                `你的 Telegram ID：${senderId ?? '未知'}`
+            );
+            return new Response('OK');
+        }
 
         // 处理 /start 命令
         if (message.text === '/start') {
@@ -87,11 +101,12 @@ export async function onRequestPost(context) {
         // 处理以文件形式发送的图片/视频
         else if (message.document) {
             const mimeType = message.document.mime_type || '';
-            if (mimeType.startsWith('image/') || mimeType.startsWith('video/')) {
+            const docExt = documentExtension(mimeType, message.document.file_name);
+            if (docExt) {
                 fileId = message.document.file_id;
-                fileExt = getExtFromMime(mimeType, message.document.file_name);
+                fileExt = docExt;
                 fileSize = message.document.file_size || 0;
-                fileType = mimeType.startsWith('image/') ? '图片' : '视频';
+                fileType = typeForExtension(docExt).category === 'image' ? '图片' : '视频';
             } else {
                 await sendTelegramMessage(env, chatId, 
                     '❌ 不支持的文件类型。\n\n只支持图片、视频和 GIF。', 
@@ -164,24 +179,21 @@ async function sendTelegramMessage(env, chatId, text, replyToMessageId = null) {
     });
 }
 
+// First allowlisted extension for each MIME type (image/jpeg -> jpg, ...).
+const EXT_FOR_MIME = {};
+for (const [ext, type] of Object.entries(ALLOWED_TYPES)) {
+    if (!(type.mime in EXT_FOR_MIME)) EXT_FOR_MIME[type.mime] = ext;
+}
+
 /**
- * 从 MIME 类型或文件名提取扩展名
+ * 以文件形式发来的图片/视频：扩展名必须在白名单里（见 ../utils/fileTypes.js，
+ * 不含 SVG），且和 MIME 的大类一致；文件名没有扩展名时按 MIME 推断。
+ * 不符合就返回 null（拒收）。
  */
-function getExtFromMime(mimeType, fileName) {
-    // 优先从文件名取
-    if (fileName && fileName.includes('.')) {
-        return fileName.split('.').pop().toLowerCase();
-    }
-    // 从 MIME 类型推断
-    const mimeMap = {
-        'image/jpeg': 'jpg',
-        'image/png': 'png',
-        'image/gif': 'gif',
-        'image/webp': 'webp',
-        'image/svg+xml': 'svg',
-        'video/mp4': 'mp4',
-        'video/webm': 'webm',
-        'video/quicktime': 'mov',
-    };
-    return mimeMap[mimeType] || 'jpg';
+function documentExtension(mimeType, fileName) {
+    const category = String(mimeType).split('/')[0];
+    if (category !== 'image' && category !== 'video') return null;
+    const ext = extensionOf(fileName) || EXT_FOR_MIME[mimeType] || '';
+    const type = typeForExtension(ext);
+    return type && type.category === category ? ext : null;
 }
